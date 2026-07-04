@@ -1,15 +1,22 @@
+from logging_config import get_logger, setup_logging
 from discord_notifier import send_message
 
-from config import DEBUG_MODE
+logger = get_logger(__name__)
+
 
 def main() -> None:
+    logger.info("Application started")
+
     success = send_message("Bot起動テスト")
 
-    if DEBUG_MODE:
-        if success:
-            print("成功")
-        else:
-            print("失敗")
+    if success:
+        logger.info("Discord notification succeeded")
+    else:
+        logger.error("Discord notification failed")
+
+    logger.info("Application finished")
+
 
 if __name__ == "__main__":
+    setup_logging()
     main()

@@ -12,6 +12,7 @@ __pycache__/
 .python-version
 
 # Logs
+logs/
 *.log
 
 # VS Code
