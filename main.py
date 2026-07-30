@@ -7,8 +7,14 @@ logger = get_logger(__name__)
 
 def main() -> None:
     logger.info("Application started")
-    bot.run(DISCORD_TOKEN)
-    logger.info("Application finished")
+
+    try:
+        bot.run(DISCORD_TOKEN)
+    except Exception:
+        logger.exception("Unexpected error occurred")
+        raise
+    finally:
+        logger.info("Application finished")
 
 
 if __name__ == "__main__":

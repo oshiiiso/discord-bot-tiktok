@@ -43,8 +43,8 @@ async def check_live_status(tiktok_id: str) -> LiveStatus:
         return LiveStatus.UNKNOWN
 
 
-async def fetch_room_details(tiktok_id: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    """配信中のTikTokユーザーの配信タイトル・概要・サムネイル画像を取得する。
+async def fetch_room_details(tiktok_id: str) -> tuple[Optional[str], Optional[str]]:
+    """配信中のTikTokユーザーの配信タイトル・サムネイル画像を取得する。
 
     年齢制限などで取得できない場合や値が空の場合は None を返す
     （呼び出し側は通知自体を継続し、該当欄を省略すること）。
@@ -53,9 +53,7 @@ async def fetch_room_details(tiktok_id: str) -> tuple[Optional[str], Optional[st
         tiktok_id: TikTokのユニークID（@なし）。
 
     Returns:
-        (title, summary, cover_url) のタプル。取得できない項目はそれぞれ None。
-        summary: 配信の紹介文（introduction）が設定されていればそれを、
-                 未設定ならプロフィールの自己紹介文（「概要」、bio_description）を代用する。
+        (title, cover_url) のタプル。取得できない項目はそれぞれ None。
         cover_url: 配信サムネイル画像のURL。
     """
     client = TikTokLiveClient(unique_id=tiktok_id)
@@ -65,26 +63,16 @@ async def fetch_room_details(tiktok_id: str) -> tuple[Optional[str], Optional[st
     except TikTokLiveError as e:
         # AgeRestrictedError（年齢制限）等もここで捕捉される（TikTokLiveErrorのサブクラスのため）
         logger.warning("配信情報の取得に失敗しました(@%s): %s", tiktok_id, e)
-        return None, None, None
+        return None, None
     except Exception:
         logger.exception("配信情報取得中に予期しないエラーが発生しました(@%s)", tiktok_id)
-        return None, None, None
+        return None, None
 
     title = room_info.get("title") or None
-
-    # 配信作成時に入力できる「紹介文」。多くの配信者は未設定のことが多い
-    introduction = room_info.get("introduction") or None
-
-    if introduction:
-        summary = introduction
-    else:
-        # 配信固有の紹介文がなければ、プロフィールの自己紹介文（「概要」）を代用する
-        owner = room_info.get("owner") or {}
-        summary = owner.get("bio_description") or None
 
     # 配信サムネイル画像のURL（あればEmbedに表示する）
     cover = room_info.get("cover") or {}
     url_list = cover.get("url_list") or []
     cover_url = url_list[0] if url_list else None
 
-    return title, summary, cover_url
+    return title, cover_url

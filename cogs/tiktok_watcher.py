@@ -1,13 +1,42 @@
+import asyncio
+import random
+import time
+from dataclasses import dataclass
+
 import discord
 from discord.ext import commands, tasks
 
-from config import NOTIFY_CHANNEL_ID, POLL_INTERVAL_SECONDS
+from config import (
+    LIVE_POLL_INTERVAL_SECONDS,
+    MAX_BACKOFF_SECONDS,
+    NOTIFY_CHANNEL_ID,
+    POLL_INTERVAL_SECONDS,
+    POLL_JITTER_RATIO,
+    SCHEDULER_TICK_SECONDS,
+)
 from logging_config import get_logger
 from services.state import StreamState, load_state, save_state
 from services.streamers import load_streamers
 from services.tiktok_monitor import LiveStatus, check_live_status, fetch_room_details
 
 logger = get_logger(__name__)
+
+# 配信者を1人ずつ処理する際、リクエストの間に挟むランダムな待機時間（秒）。
+# 機械的な一定間隔アクセスに見えないようにするための揺らぎ。
+MIN_REQUEST_GAP_SECONDS = 0.5
+MAX_REQUEST_GAP_SECONDS = 2.0
+
+
+@dataclass
+class _StreamSchedule:
+    """配信者ごとのポーリングスケジュール（メモリ上のみで管理、永続化しない）。
+
+    Bot再起動時はリセットされ、全配信者が次回チェック対象になる
+    （起動直後に現在の配信状態を素早く把握するため、これは意図した動作）。
+    """
+
+    next_check_at: float = 0.0   # time.monotonic() 基準の次回チェック予定時刻
+    consecutive_errors: int = 0  # 連続エラー回数（指数バックオフの計算に使用）
 
 
 class TikTokWatcher(commands.Cog):
@@ -19,10 +48,23 @@ class TikTokWatcher(commands.Cog):
         # role_id -> LiveStatus。パネル表示時に「存在しないユーザー」等を示すためのキャッシュ
         # （メモリ上のみ。Bot再起動時はリセットされ、次回ポーリングで再構築される）
         self.status_cache: dict[str, LiveStatus] = {}
-        self.check_streams.start()
+        # role_id -> _StreamSchedule。配信者ごとの次回チェック時刻・連続エラー数
+        # （メモリ上のみ。レート制限回避のためのスケジューリング状態）
+        self._schedules: dict[str, _StreamSchedule] = {}
 
-    def cog_unload(self) -> None:
+    async def cog_load(self) -> None:
+        """Cogがロードされた際にポーリングループを開始する。
+
+        __init__ ではなくここで start() を呼ぶことで、イベントループが
+        確実に稼働しているタイミングで安全にループを開始できる。
+        """
+        if not self.check_streams.is_running():
+            self.check_streams.start()
+            logger.info("TikTok監視ループを開始しました")
+
+    async def cog_unload(self) -> None:
         self.check_streams.cancel()
+        logger.info("TikTok監視ループを停止しました")
 
     def is_user_not_found(self, role_id: str) -> bool:
         """指定ロールIDに紐づくTikTokユーザーが存在しないと判明しているかどうか。
@@ -31,12 +73,57 @@ class TikTokWatcher(commands.Cog):
         """
         return self.status_cache.get(role_id) == LiveStatus.NOT_FOUND
 
-    @tasks.loop(seconds=POLL_INTERVAL_SECONDS)
+    @staticmethod
+    def _calc_next_interval(is_live: bool) -> float:
+        """正常判定できた場合の、次回チェックまでの間隔を計算する（jitter込み）。
+
+        配信中は LIVE_POLL_INTERVAL_SECONDS、オフライン中は POLL_INTERVAL_SECONDS を
+        基準とし、それぞれ ±POLL_JITTER_RATIO の範囲でランダムに揺らす。
+        （例: 基準60秒・比率0.1 → 54〜66秒の範囲でランダム）
+        """
+        base = LIVE_POLL_INTERVAL_SECONDS if is_live else POLL_INTERVAL_SECONDS
+        jitter = base * POLL_JITTER_RATIO
+        return random.uniform(base - jitter, base + jitter)
+
+    @staticmethod
+    def _calc_backoff_interval(consecutive_errors: int) -> float:
+        """通信エラー発生時の、次回チェックまでの待機時間を指数バックオフで計算する。
+
+        1回目: 約 POLL_INTERVAL_SECONDS 秒、以降エラーが連続するたびに倍々に増え、
+        MAX_BACKOFF_SECONDS を上限とする。
+        """
+        backoff = POLL_INTERVAL_SECONDS * (2 ** (consecutive_errors - 1))
+        return min(backoff, MAX_BACKOFF_SECONDS)
+
+    @tasks.loop(seconds=SCHEDULER_TICK_SECONDS)
     async def check_streams(self) -> None:
+        """配信者ごとの次回チェック時刻を確認し、到来している配信者だけを直列に処理する。
+
+        ループ自体は SCHEDULER_TICK_SECONDS（デフォルト5秒）という短い間隔で回るが、
+        実際にTikTokへ問い合わせるのは各配信者の next_check_at を過ぎた場合のみ。
+        これにより配信者ごとに異なるタイミングでチェックが分散される。
+        """
         streamers = [s for s in load_streamers() if s.get("tiktok_id")]
 
         if not streamers:
+            logger.debug("チェック対象の配信者が0件のため、今回はスキップします。")
             return
+
+        now = time.monotonic()
+
+        due_streamers = []
+        for s in streamers:
+            schedule = self._schedules.setdefault(s["role_id"], _StreamSchedule())
+            if schedule.next_check_at <= now:
+                due_streamers.append(s)
+
+        if not due_streamers:
+            return
+
+        logger.debug(
+            "配信状態チェックを開始します（対象: %d/%d件、周回数: %d）",
+            len(due_streamers), len(streamers), self.check_streams.current_loop,
+        )
 
         channel = self.bot.get_channel(NOTIFY_CHANNEL_ID)
         if channel is None:
@@ -44,23 +131,48 @@ class TikTokWatcher(commands.Cog):
                 "通知チャンネル(ID: %s)が見つかりません。config の NOTIFY_CHANNEL_ID を確認してください。",
                 NOTIFY_CHANNEL_ID,
             )
+        else:
+            logger.debug("通知チャンネル: #%s (ID: %s)", getattr(channel, "name", "?"), NOTIFY_CHANNEL_ID)
 
         state_changed = False
 
-        for s in streamers:
+        for i, s in enumerate(due_streamers):
+            # 1人目は待機不要。2人目以降は前のリクエストとの間に
+            # ランダムな間隔を空けて直列に処理する（同時アクセスを避ける）。
+            if i > 0:
+                await asyncio.sleep(random.uniform(MIN_REQUEST_GAP_SECONDS, MAX_REQUEST_GAP_SECONDS))
+
             role_id = s["role_id"]
             tiktok_id = s["tiktok_id"]
             label = s["label"]
+            schedule = self._schedules[role_id]
 
             status = await check_live_status(tiktok_id)
             self.status_cache[role_id] = status
+            logger.debug("  - %s (@%s): %s", label, tiktok_id, status.value)
 
-            # 判定不能・ユーザー不存在の場合は状態を変えずスキップ
-            # （誤検知による重複/欠落通知を防ぐ）
-            if status in (LiveStatus.UNKNOWN, LiveStatus.NOT_FOUND):
+            if status == LiveStatus.UNKNOWN:
+                # 通信エラー等: 状態は変更せず、指数バックオフで次回チェックを遅らせる
+                schedule.consecutive_errors += 1
+                backoff = self._calc_backoff_interval(schedule.consecutive_errors)
+                schedule.next_check_at = now + backoff
+                logger.debug(
+                    "  -> 判定エラーのため次回チェックまで%.1f秒待機します（連続%d回目）",
+                    backoff, schedule.consecutive_errors,
+                )
                 continue
 
+            if status == LiveStatus.NOT_FOUND:
+                # ユーザー不存在: 状態は変更せず、通常間隔で次回チェックする
+                schedule.consecutive_errors = 0
+                schedule.next_check_at = now + self._calc_next_interval(is_live=False)
+                continue
+
+            # 正常に判定できたので連続エラーカウントをリセットし、通常間隔を設定
+            schedule.consecutive_errors = 0
             is_live = status == LiveStatus.LIVE
+            schedule.next_check_at = now + self._calc_next_interval(is_live=is_live)
+
             current = self.state.get(role_id, StreamState())
 
             if is_live != current.is_live:
@@ -95,18 +207,15 @@ class TikTokWatcher(commands.Cog):
         url = f"https://www.tiktok.com/@{tiktok_id}/live"
         mention = f"<@&{role_id}>"
 
-        title, summary, cover_url = await fetch_room_details(tiktok_id)
+        title, cover_url = await fetch_room_details(tiktok_id)
 
         embed = discord.Embed(
             title=f"🔴 {label} が配信を開始しました！",
             url=url,
-            description=f"[配信を見る]({url})",
             color=discord.Color.from_rgb(254, 44, 85),  # TikTokブランドカラー
         )
         if title:
             embed.add_field(name="📝 タイトル", value=title[:1024], inline=False)
-        if summary:
-            embed.add_field(name="📋 概要", value=summary[:1024], inline=False)
         if cover_url:
             embed.set_image(url=cover_url)
 
@@ -160,6 +269,20 @@ class TikTokWatcher(commands.Cog):
     @check_streams.before_loop
     async def before_check_streams(self) -> None:
         await self.bot.wait_until_ready()
+
+    @check_streams.error
+    async def on_check_streams_error(self, error: Exception) -> None:
+        """check_streams ループ内で捕捉されなかった例外のハンドラ。
+
+        discord.ext.tasks は素の例外が発生するとループ自体を完全に停止させる
+        （自動リトライされるのは接続系の一部例外のみ）。ここで確実にログへ
+        記録した上で、ループを再起動して監視を継続させる。
+        """
+        logger.exception("check_streams ループで予期しないエラーが発生しました。", exc_info=error)
+
+        if not self.check_streams.is_running():
+            logger.warning("check_streams ループを再起動します。")
+            self.check_streams.restart()
 
 
 async def setup(bot: commands.Bot) -> None:
