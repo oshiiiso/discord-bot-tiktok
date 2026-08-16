@@ -1,14 +1,19 @@
 {
   "streamers": [
     {
-      "label": "シーソ",
+      "label": "test01",
       "role_id": "1523653867420651611",
-      "tiktok_id": "oshiso123"
+      "tiktok_id": "test01"
     },
     {
-      "label": "フータ男",
+      "label": "test02",
       "role_id": "1523654163437846548",
-      "tiktok_id": ".huutao"
+      "tiktok_id": "test02"
+    },
+    {
+      "label": "test03",
+      "role_id": "123456789",
+      "tiktok_id": "test03"
     }
   ]
 }

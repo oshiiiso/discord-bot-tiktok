@@ -3,14 +3,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-# デバッグモード時はログレベルを強制的にDEBUGにする
-if DEBUG_MODE:
-    LOG_LEVEL = "DEBUG"
+# ログファイルの保存日数。これより古い logs/*.log は起動・ローテーション時に自動削除される。
+LOG_RETENTION_DAYS = int(os.getenv("LOG_RETENTION_DAYS") or "30")
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+
+# スラッシュコマンドの同期先を特定のサーバー（ギルド）に限定するためのID。
+# 未設定の場合はグローバル同期（反映まで最大1時間程度かかる）になる。
+# 開発中や単一サーバー運用の場合は設定しておくと、コマンドが即座に反映される。
+GUILD_ID = int(os.getenv("GUILD_ID") or "0") or None
 
 # TikTok配信通知を送信するチャンネルのID
 # 環境変数が未設定・空文字の場合は 0 として扱う（getenv の第2引数は
@@ -39,3 +42,10 @@ MAX_BACKOFF_SECONDS = int(os.getenv("MAX_BACKOFF_SECONDS") or "600")
 # なく、「各配信者ごとの次回チェック時刻を過ぎていないか」を確認する解像度。
 # 短くしておくことで、配信者ごとに異なるタイミングでチェックが分散される。
 SCHEDULER_TICK_SECONDS = int(os.getenv("SCHEDULER_TICK_SECONDS") or "5")
+
+# 配信者を1人ずつ処理する際、リクエストの間に挟むランダムな待機時間（秒）の範囲。
+MIN_REQUEST_GAP_SECONDS = float(os.getenv("MIN_REQUEST_GAP_SECONDS") or "0.5")
+MAX_REQUEST_GAP_SECONDS = float(os.getenv("MAX_REQUEST_GAP_SECONDS") or "2.0")
+
+# 配信者選択パネル（エフェメラルメッセージ）のタイムアウト秒数。
+PANEL_VIEW_TIMEOUT_SECONDS = int(os.getenv("PANEL_VIEW_TIMEOUT_SECONDS") or "120")

@@ -1,8 +1,12 @@
-from datetime import datetime
+from datetime import date, datetime, timedelta
 import logging
 from pathlib import Path
+import re
 
-from config import LOG_LEVEL
+from config import LOG_LEVEL, LOG_RETENTION_DAYS
+
+LOG_DIR = Path("logs")
+LOG_FILENAME_PATTERN = re.compile(r"^\d{8}\.log$")
 
 # DEBUG_MODE時でも詳細ログを抑制したい外部ライブラリのロガー名。
 # httpx/httpcore は TikTokLive が内部で使うHTTPクライアントで、
@@ -23,13 +27,27 @@ def _suppress_noisy_loggers() -> None:
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
-class DailyFileHandler(logging.Handler):
-    """日付が変わったタイミングで自動的に新しいログファイルに切り替えるハンドラ。
+def _cleanup_old_logs(retention_days: int) -> None:
+    """logs/yyyymmdd.log のうち、保存期限を過ぎたファイルを削除する。"""
+    if not LOG_DIR.exists():
+        return
 
-    logs/{年}/{月日}.log の形式でファイルを分割する。
-    Botのように日をまたいで動き続けるプロセスでも、再起動なしで
-    正しい日付のファイルにログを出力し続けられる。
-    """
+    threshold = date.today() - timedelta(days=retention_days)
+
+    for log_file in LOG_DIR.glob("*.log"):
+        if not LOG_FILENAME_PATTERN.match(log_file.name):
+            continue
+
+        file_date = datetime.strptime(log_file.stem, "%Y%m%d").date()
+        if file_date < threshold:
+            try:
+                log_file.unlink()
+            except OSError as e:
+                logging.getLogger(__name__).warning("古いログファイルの削除に失敗しました: %s (%s)", log_file, e)
+
+
+class DailyFileHandler(logging.Handler):
+    """日付が変わったら自動でファイルを切り替えるハンドラ。logs/yyyymmdd.log に出力する。"""
 
     def __init__(self, formatter: logging.Formatter):
         super().__init__()
@@ -46,13 +64,14 @@ class DailyFileHandler(logging.Handler):
         if self._file_handler is not None:
             self._file_handler.close()
 
-        log_dir = Path("logs") / f"{today:%Y}"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / f"{today:%m%d}.log"
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        log_file = LOG_DIR / f"{today:%Y%m%d}.log"
 
         self._file_handler = logging.FileHandler(log_file, encoding="utf-8")
         self._file_handler.setFormatter(self.formatter)
         self._current_date = today
+
+        _cleanup_old_logs(LOG_RETENTION_DAYS)
 
     def emit(self, record: logging.LogRecord) -> None:
         self._rotate_if_needed()

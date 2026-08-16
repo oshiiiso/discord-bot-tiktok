@@ -2,13 +2,17 @@ import asyncio
 import random
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 
 from config import (
     LIVE_POLL_INTERVAL_SECONDS,
     MAX_BACKOFF_SECONDS,
+    MAX_REQUEST_GAP_SECONDS,
+    MIN_REQUEST_GAP_SECONDS,
     NOTIFY_CHANNEL_ID,
     POLL_INTERVAL_SECONDS,
     POLL_JITTER_RATIO,
@@ -20,11 +24,6 @@ from services.streamers import load_streamers
 from services.tiktok_monitor import LiveStatus, check_live_status, fetch_room_details
 
 logger = get_logger(__name__)
-
-# 配信者を1人ずつ処理する際、リクエストの間に挟むランダムな待機時間（秒）。
-# 機械的な一定間隔アクセスに見えないようにするための揺らぎ。
-MIN_REQUEST_GAP_SECONDS = 0.5
-MAX_REQUEST_GAP_SECONDS = 2.0
 
 
 @dataclass
@@ -51,6 +50,10 @@ class TikTokWatcher(commands.Cog):
         # role_id -> _StreamSchedule。配信者ごとの次回チェック時刻・連続エラー数
         # （メモリ上のみ。レート制限回避のためのスケジューリング状態）
         self._schedules: dict[str, _StreamSchedule] = {}
+        # role_id -> 開始通知メッセージID（/test start の送信結果を一時的に記憶する）。
+        # /test end 実行時にこれを使って編集し、実際の監視ループと同じ「編集して
+        # 終了扱いにする」挙動をテストできるようにする（state.jsonには影響しない）。
+        self._test_start_message_ids: dict[str, int] = {}
 
     async def cog_load(self) -> None:
         """Cogがロードされた際にポーリングループを開始する。
@@ -213,6 +216,7 @@ class TikTokWatcher(commands.Cog):
             title=f"🔴 {label} が配信を開始しました！",
             url=url,
             color=discord.Color.from_rgb(254, 44, 85),  # TikTokブランドカラー
+            timestamp=datetime.now(timezone.utc),
         )
         if title:
             embed.add_field(name="📝 タイトル", value=title[:1024], inline=False)
@@ -242,22 +246,23 @@ class TikTokWatcher(commands.Cog):
             title=f"⚫ {label} の配信が終了しました",
             url=url,
             color=discord.Color.from_rgb(128, 128, 128),
+            timestamp=datetime.now(timezone.utc),
         )
 
-        # 開始通知のメッセージIDが分かっていれば、それへの返信として送る
-        if reply_to_message_id is not None and hasattr(channel, "get_partial_message"):
+        # 開始通知のメッセージが分かっていれば、それを編集して終了扱いにする
+        # （返信で新規メッセージを増やさず、1メッセージに開始〜終了をまとめる）
+        if reply_to_message_id is not None and hasattr(channel, "fetch_message"):
             try:
-                partial_message = channel.get_partial_message(reply_to_message_id)
-                # 終了通知はロールメンションなし（メンション通知で騒がしくなるのを防ぐ）
-                await partial_message.reply(embed=embed, mention_author=False)
+                start_message = await channel.fetch_message(reply_to_message_id)
+                await start_message.edit(embed=embed)
                 return
             except discord.NotFound:
-                logger.warning("返信先の開始通知メッセージが見つかりませんでした。通常の通知として送信します。")
+                logger.warning("編集対象の開始通知メッセージが見つかりませんでした。通常の通知として送信します。")
             except discord.Forbidden:
-                logger.error("チャンネル(ID: %s)へのメッセージ送信権限がありません。", NOTIFY_CHANNEL_ID)
+                logger.error("チャンネル(ID: %s)のメッセージ編集権限がありません。", NOTIFY_CHANNEL_ID)
                 return
             except discord.HTTPException as e:
-                logger.warning("開始通知への返信に失敗しました。通常の通知として送信します: %s", e)
+                logger.warning("開始通知の編集に失敗しました。通常の通知として送信します: %s", e)
 
         try:
             await channel.send(embed=embed)
@@ -265,6 +270,80 @@ class TikTokWatcher(commands.Cog):
             logger.error("チャンネル(ID: %s)へのメッセージ送信権限がありません。", NOTIFY_CHANNEL_ID)
         except discord.HTTPException as e:
             logger.error("通知メッセージの送信に失敗しました: %s", e)
+
+    def _find_streamer(self, tiktok_id: str) -> "dict | None":
+        """streamers.json から tiktok_id（大文字小文字区別なし）に一致する配信者を探す。"""
+        tiktok_id_lower = tiktok_id.lower()
+        for s in load_streamers():
+            if s.get("tiktok_id", "").lower() == tiktok_id_lower:
+                return s
+        return None
+
+    test_group = app_commands.Group(name="test", description="通知テスト用コマンドグループ")
+
+    @test_group.command(name="start", description="配信開始通知のテスト送信（実際の状態は変更しない）")
+    @app_commands.describe(tiktok_id="streamers.jsonに登録されているTikTokのユニークID")
+    @app_commands.checks.has_permissions(manage_roles=True)
+    async def test_start(self, interaction: discord.Interaction, tiktok_id: str) -> None:
+        """配信開始通知のテスト送信（実際の状態は変更しない）。"""
+        streamer = self._find_streamer(tiktok_id)
+        if streamer is None:
+            await interaction.response.send_message(
+                f"⚠️ `{tiktok_id}` は streamers.json に登録されていません。", ephemeral=True
+            )
+            return
+
+        channel = self.bot.get_channel(NOTIFY_CHANNEL_ID)
+        if channel is None:
+            await interaction.response.send_message(
+                "⚠️ 通知チャンネルが見つかりません。config の NOTIFY_CHANNEL_ID を確認してください。",
+                ephemeral=True,
+            )
+            return
+
+        message_id = await self._notify_live_start(channel, streamer["label"], streamer["tiktok_id"], streamer["role_id"])
+        if message_id is not None:
+            self._test_start_message_ids[streamer["role_id"]] = message_id
+        await interaction.response.send_message(
+            f"✅ `{streamer['label']}` の配信開始通知テストを送信しました。", ephemeral=True
+        )
+
+    @test_group.command(name="end", description="配信終了通知のテスト送信（実際の状態は変更しない）")
+    @app_commands.describe(tiktok_id="streamers.jsonに登録されているTikTokのユニークID")
+    @app_commands.checks.has_permissions(manage_roles=True)
+    async def test_end(self, interaction: discord.Interaction, tiktok_id: str) -> None:
+        """配信終了通知のテスト送信（実際の状態は変更しない）。"""
+        streamer = self._find_streamer(tiktok_id)
+        if streamer is None:
+            await interaction.response.send_message(
+                f"⚠️ `{tiktok_id}` は streamers.json に登録されていません。", ephemeral=True
+            )
+            return
+
+        channel = self.bot.get_channel(NOTIFY_CHANNEL_ID)
+        if channel is None:
+            await interaction.response.send_message(
+                "⚠️ 通知チャンネルが見つかりません。config の NOTIFY_CHANNEL_ID を確認してください。",
+                ephemeral=True,
+            )
+            return
+
+        message_id = self._test_start_message_ids.pop(streamer["role_id"], None)
+        await self._notify_live_end(channel, streamer["label"], streamer["tiktok_id"], reply_to_message_id=message_id)
+        await interaction.response.send_message(
+            f"✅ `{streamer['label']}` の配信終了通知テストを送信しました。", ephemeral=True
+        )
+
+    async def _on_test_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+        if isinstance(error, app_commands.MissingPermissions):
+            await interaction.response.send_message(
+                "⚠️ このコマンドを実行するには「ロールの管理」権限が必要です。", ephemeral=True
+            )
+        else:
+            raise error
+
+    test_start.error(_on_test_error)
+    test_end.error(_on_test_error)
 
     @check_streams.before_loop
     async def before_check_streams(self) -> None:
@@ -286,4 +365,7 @@ class TikTokWatcher(commands.Cog):
 
 
 async def setup(bot: commands.Bot) -> None:
+    # test_group は app_commands.Group をクラス属性として持つため、
+    # add_cog() 時に自動的にコマンドツリーへ登録される。
+    # ここで改めて bot.tree.add_command() を呼ぶと二重登録エラーになるため呼ばない。
     await bot.add_cog(TikTokWatcher(bot))

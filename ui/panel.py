@@ -1,5 +1,6 @@
 import discord
 
+from config import PANEL_VIEW_TIMEOUT_SECONDS
 from services.streamers import load_streamers
 
 # Discordの仕様上、Select 1個につき最大25選択肢、View 1個につき最大5コンポーネント
@@ -143,7 +144,7 @@ class StreamerSelect(discord.ui.Select):
 
 class StreamerView(discord.ui.View):
     def __init__(self, bot, guild: discord.Guild, user: discord.Member):
-        super().__init__(timeout=120)
+        super().__init__(timeout=PANEL_VIEW_TIMEOUT_SECONDS)
 
         streamers = load_streamers()
         chunks = _chunk(streamers, MAX_OPTIONS_PER_SELECT)[:MAX_SELECTS_PER_VIEW]
