@@ -240,21 +240,30 @@ class TikTokWatcher(commands.Cog):
         tiktok_id: str,
         reply_to_message_id: "int | None" = None,
     ) -> None:
-        url = f"https://www.tiktok.com/@{tiktok_id}"
+        end_title = f"⚫ {label} の配信が終了しました"
+        end_color = discord.Color.from_rgb(128, 128, 128)
 
-        embed = discord.Embed(
-            title=f"⚫ {label} の配信が終了しました",
-            url=url,
-            color=discord.Color.from_rgb(128, 128, 128),
-            timestamp=datetime.now(timezone.utc),
-        )
+        def build_end_embed(start_embed: "discord.Embed | None" = None) -> discord.Embed:
+            # 開始通知があればタイトル・サムネ等はそのまま残し、文言と色だけ差し替える
+            if start_embed is not None:
+                embed = start_embed.copy()
+                embed.title = end_title
+                embed.color = end_color
+                return embed
+            return discord.Embed(
+                title=end_title,
+                url=f"https://www.tiktok.com/@{tiktok_id}",
+                color=end_color,
+                timestamp=datetime.now(timezone.utc),
+            )
 
         # 開始通知のメッセージが分かっていれば、それを編集して終了扱いにする
         # （返信で新規メッセージを増やさず、1メッセージに開始〜終了をまとめる）
         if reply_to_message_id is not None and hasattr(channel, "fetch_message"):
             try:
                 start_message = await channel.fetch_message(reply_to_message_id)
-                await start_message.edit(embed=embed)
+                start_embed = start_message.embeds[0] if start_message.embeds else None
+                await start_message.edit(embed=build_end_embed(start_embed))
                 return
             except discord.NotFound:
                 logger.warning("編集対象の開始通知メッセージが見つかりませんでした。通常の通知として送信します。")
@@ -265,7 +274,7 @@ class TikTokWatcher(commands.Cog):
                 logger.warning("開始通知の編集に失敗しました。通常の通知として送信します: %s", e)
 
         try:
-            await channel.send(embed=embed)
+            await channel.send(embed=build_end_embed())
         except discord.Forbidden:
             logger.error("チャンネル(ID: %s)へのメッセージ送信権限がありません。", NOTIFY_CHANNEL_ID)
         except discord.HTTPException as e:
